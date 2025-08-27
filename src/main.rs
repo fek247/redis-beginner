@@ -3,6 +3,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 
+const CRLF_TERMINATOR_LEN: usize = 2;
+
 const SUPPORT_COMMANDS: [&str; 2] = ["ping", "echo"];
 
 fn main() {
@@ -29,7 +31,7 @@ fn handle_response(mut stream: TcpStream) {
     loop {
         let mut buf = [0; 512];
         let size = stream.read(&mut buf).unwrap();
-        println!("message: {:?}", buf);
+        // println!("message: {:?}", buf);
         if size <= 0 {
             break;
         }
@@ -40,34 +42,35 @@ fn handle_response(mut stream: TcpStream) {
 
 fn command_parser(buf: [u8; 512], stream: &mut &TcpStream) -> Result<(), CommandParserErr>  {
     let number_of_elements = asc2_to_decimal(buf[1]);
-    let crlf_terminator_len = 2;
-    // if cfg!(windows) {
-    //     crlf_terminator_len = 2;
-    // }
-    println!("len down line: {crlf_terminator_len}");
     // First byte: '*' 
     // Second byte: number of elements
-    let mut index = 2 + crlf_terminator_len;
+    let mut index = 2 + CRLF_TERMINATOR_LEN;
+    let mut commands: Vec<String> = vec![];
     for _ in 0..number_of_elements {
         // character $
         index += 1;
         let len = asc2_to_decimal(buf[index]) as usize;
-        println!("command length: {len}");
-        index += 1;
-        let command = str::from_utf8(&buf[index..index+len]).unwrap().to_lowercase();
-        // println!("{}", command);
-        if SUPPORT_COMMANDS.contains(&command.as_str()) {
-            return Err(CommandParserErr::InvalidFormat);
-        } else {
-            println!("Command: {command}");
-            if command.eq("ping") {
+        index += CRLF_TERMINATOR_LEN + 1;
+        let command = str::from_utf8(&buf[index..index + len]).unwrap().to_lowercase();
+        commands.push(command);
+        let last_command = commands.last().unwrap();
+        if commands.last().unwrap().eq("ping") || commands.last().unwrap().eq("echo") {
+            if last_command == "ping" {
                 let _ = stream.write_all("+PONG\r\n".as_bytes());
-            } else if command.eq("echo") {
-                println!("hey");
+            }
+        } else {
+            let previous_command = commands.get(commands.len().saturating_sub(2)).unwrap();
+            println!("previous_command: {}", previous_command);
+            if commands.len() >= 2 && previous_command == "echo" {
+                println!("last_command: {last_command}");
+                let response = format!("${}\r\n{}\r\n", last_command.len(), last_command);
+                let _ = stream.write_all(response.as_bytes());
+            } else {
+                return Err(CommandParserErr::InvalidFormat);
             }
         }
-        index += len;
-        break;
+
+        index += len + CRLF_TERMINATOR_LEN;
     }
 
     Ok(())
