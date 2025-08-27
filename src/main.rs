@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::thread;
 
 fn main() {
     println!("Logs from your program will appear here!");
@@ -9,9 +10,11 @@ fn main() {
 
     for stream in listener.incoming() {
         match stream {
-            Ok(_stream) => {
+            Ok(stream) => {
                 println!("accepted new connection");
-                handle_response(_stream)
+                thread::spawn(|| {
+                    handle_response(stream);
+                });
             }
             Err(e) => {
                 println!("error: {}", e);
