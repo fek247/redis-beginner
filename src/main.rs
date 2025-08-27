@@ -1,5 +1,5 @@
 #![allow(unused_imports)]
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 fn main() {
@@ -21,6 +21,13 @@ fn main() {
 }
 
 fn handle_response(mut stream: TcpStream) {
-    let buf = "+PONG\r\n".as_bytes();
-    let _ = stream.write(&buf);
+    loop {
+        let mut buf = [0; 512];
+        let size = stream.read(&mut buf).unwrap();
+
+        if size <= 0 {
+            break;
+        }
+        let _ = stream.write_all("+PONG\r\n".as_bytes());
+    }
 }
