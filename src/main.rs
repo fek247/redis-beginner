@@ -5,8 +5,6 @@ use std::thread;
 
 const CRLF_TERMINATOR_LEN: usize = 2;
 
-const SUPPORT_COMMANDS: [&str; 2] = ["ping", "echo"];
-
 fn main() {
     println!("Logs from your program will appear here!");
 
@@ -31,12 +29,10 @@ fn handle_response(mut stream: TcpStream) {
     loop {
         let mut buf = [0; 512];
         let size = stream.read(&mut buf).unwrap();
-        // println!("message: {:?}", buf);
         if size <= 0 {
             break;
         }
         let _ = command_parser(buf, &mut &stream);
-        let _ = stream.write_all("+PONG\r\n".as_bytes());
     }
 }
 
@@ -49,7 +45,7 @@ fn command_parser(buf: [u8; 512], stream: &mut &TcpStream) -> Result<(), Command
     for _ in 0..number_of_elements {
         // character $
         index += 1;
-        let len = asc2_to_decimal(buf[index]) as usize;
+        let len = read_length(&buf, &mut index).unwrap();
         index += CRLF_TERMINATOR_LEN + 1;
         let command = str::from_utf8(&buf[index..index + len]).unwrap().to_lowercase();
         commands.push(command);
@@ -60,9 +56,7 @@ fn command_parser(buf: [u8; 512], stream: &mut &TcpStream) -> Result<(), Command
             }
         } else {
             let previous_command = commands.get(commands.len().saturating_sub(2)).unwrap();
-            println!("previous_command: {}", previous_command);
             if commands.len() >= 2 && previous_command == "echo" {
-                println!("last_command: {last_command}");
                 let response = format!("${}\r\n{}\r\n", last_command.len(), last_command);
                 let _ = stream.write_all(response.as_bytes());
             } else {
@@ -80,8 +74,25 @@ fn asc2_to_decimal(byte: u8) -> u8 {
     byte - b'0'
 }
 
+fn read_length(buf: &[u8], index: &mut usize) -> Result<usize, &'static str> {
+    if *index >= buf.len() {
+        return Err("invalid index");
+    }
+    let mut len_buf = Vec::new();
+    loop {
+        len_buf.push(buf[*index]);
+        if buf[*index + 1] == b'\r' {
+            break;
+        }
+        *index += 1;
+    }
+    let s = String::from_utf8(len_buf).unwrap();
+    let len = s.parse::<usize>().unwrap();
+
+    Ok(len)
+}
+
 #[derive(Debug)]
 enum CommandParserErr {
     InvalidFormat,
-    UnknownCommand
 }
