@@ -1,9 +1,12 @@
 #![allow(unused_imports)]
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 
 const CRLF_TERMINATOR_LEN: usize = 2;
+
+const SUPPORT_COMMANDS: [&str; 4] = ["ping", "echo", "set", "get"];
 
 fn main() {
     println!("Logs from your program will appear here!");
@@ -32,42 +35,56 @@ fn handle_response(mut stream: TcpStream) {
         if size <= 0 {
             break;
         }
-        let _ = command_parser(buf, &mut &stream);
+        let response = command_parser(buf);
+        match response {
+            Ok(command) => {
+                let _ = stream.write_all(command.response().as_bytes());
+            },
+            Err(e) => {
+                println!("error: {:?}", e);
+            }
+        }
     }
 }
 
-fn command_parser(buf: [u8; 512], stream: &mut &TcpStream) -> Result<(), CommandParserErr>  {
+fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
     let number_of_elements = asc2_to_decimal(buf[1]);
     // First byte: '*' 
     // Second byte: number of elements
     let mut index = 2 + CRLF_TERMINATOR_LEN;
-    let mut commands: Vec<String> = vec![];
-    for _ in 0..number_of_elements {
+    let mut command = Command {
+        name: String::new(),
+        key: String::new(),
+        value: String::new()
+    };
+
+    for i in 0..number_of_elements {
         // character $
         index += 1;
         let len = read_length(&buf, &mut index).unwrap();
         index += CRLF_TERMINATOR_LEN + 1;
-        let command = str::from_utf8(&buf[index..index + len]).unwrap().to_lowercase();
-        commands.push(command);
-        let last_command = commands.last().unwrap();
-        if commands.last().unwrap().eq("ping") || commands.last().unwrap().eq("echo") {
-            if last_command == "ping" {
-                let _ = stream.write_all("+PONG\r\n".as_bytes());
-            }
+        let value = str::from_utf8(&buf[index..index + len]).unwrap().to_lowercase();
+
+        if SUPPORT_COMMANDS.contains(&value.as_str()) {
+            command.name = value
         } else {
-            let previous_command = commands.get(commands.len().saturating_sub(2)).unwrap();
-            if commands.len() >= 2 && previous_command == "echo" {
-                let response = format!("${}\r\n{}\r\n", last_command.len(), last_command);
-                let _ = stream.write_all(response.as_bytes());
-            } else {
-                return Err(CommandParserErr::InvalidFormat);
+            if command.name.is_empty() {
+                return Err(CommandParserErr::UnknowCommand);
+            }
+
+            if i == 1 {
+                command.key = value.clone();
+            }
+
+            if i == 2 {
+                command.value = value.clone();
             }
         }
 
         index += len + CRLF_TERMINATOR_LEN;
     }
 
-    Ok(())
+    Ok(command)
 }
 
 fn asc2_to_decimal(byte: u8) -> u8 {
@@ -95,4 +112,23 @@ fn read_length(buf: &[u8], index: &mut usize) -> Result<usize, &'static str> {
 #[derive(Debug)]
 enum CommandParserErr {
     InvalidFormat,
+    UnknowCommand,
+}
+
+struct Command {
+    name: String,
+    key: String,
+    value: String
+}
+
+impl Command {
+    pub fn response(&self) -> String {
+        match self.name.as_str() {
+            "ping" => String::from("+PONG\r\n"),
+            "echo" => format!("${}\r\n{}\r\n", self.key.len(), self.key),
+            "get"  => format!("${}\r\n", self.value),
+            "set"  => String::from("+OK\r\n"),
+            _      => String::from("-ERR unknown command\r\n"),
+        }
+    }
 }
