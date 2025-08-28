@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 const CRLF_TERMINATOR_LEN: usize = 2;
@@ -12,13 +13,15 @@ fn main() {
     println!("Logs from your program will appear here!");
 
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
+    let hash_map: HashMap<String, String> = HashMap::new();
+    let hashmap = Arc::new(Mutex::new(hash_map));
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 println!("accepted new connection");
-                thread::spawn(|| {
-                    handle_response(stream);
+                thread::spawn(move || {
+                    handle_response(stream, hashmap);
                 });
             }
             Err(e) => {
@@ -28,16 +31,23 @@ fn main() {
     }
 }
 
-fn handle_response(mut stream: TcpStream) {
+fn handle_response(mut stream: TcpStream, mut hashmap: HashMap<String, String>) {
     loop {
         let mut buf = [0; 512];
         let size = stream.read(&mut buf).unwrap();
         if size <= 0 {
             break;
         }
-        let response = command_parser(buf);
-        match response {
-            Ok(command) => {
+        let command = command_parser(buf);
+        match command {
+            Ok(mut command) => {
+                if command.name == "set" {
+                    hashmap.insert(command.key.clone(), command.value.clone());
+                }
+                if command.name == "get" {
+                    let value = hashmap.get(&command.key).unwrap();
+                    command.value = value.clone();
+                }
                 let _ = stream.write_all(command.response().as_bytes());
             },
             Err(e) => {
@@ -126,7 +136,7 @@ impl Command {
         match self.name.as_str() {
             "ping" => String::from("+PONG\r\n"),
             "echo" => format!("${}\r\n{}\r\n", self.key.len(), self.key),
-            "get"  => format!("${}\r\n", self.value),
+            "get"  => format!("${}\r\n{}\r\n", self.value.len(), self.value),
             "set"  => String::from("+OK\r\n"),
             _      => String::from("-ERR unknown command\r\n"),
         }
