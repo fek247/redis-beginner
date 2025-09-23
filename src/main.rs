@@ -1,5 +1,5 @@
 #![allow(unused_imports)]
-use std::collections::HashMap;
+use std::collections::{HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -9,20 +9,62 @@ const CRLF_TERMINATOR_LEN: usize = 2;
 
 const SUPPORT_COMMANDS: [&str; 4] = ["ping", "echo", "set", "get"];
 
+struct AppState {
+    db: Arc<Mutex<DB>>
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        let state = AppState {
+            db: Arc::new(Mutex::new(DB::new())),
+        };
+        state
+    }
+}
+
+struct DB {
+    entries: HashMap<String, String>,
+    pub_sub: HashMap<String, String>,
+}
+
+impl DB {
+    pub fn new() -> Self {
+        let db = DB {
+            entries: HashMap::new(),
+            pub_sub: HashMap::new()
+        };
+        db
+    }
+
+    pub fn set(&mut self, key: &String, value: &String) {
+        self.entries.insert(key.to_string(), value.to_string());
+    }
+
+    pub fn get(&mut self, key: &String) -> String {
+        let value = self.entries.get(key);
+        match value {
+            Some(val) => val.to_string(),
+            None => String::new(),
+        }
+    }
+}
+
 fn main() {
     println!("Logs from your program will appear here!");
 
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
-    let hash_map: HashMap<String, String> = HashMap::new();
-    let hashmap = Arc::new(Mutex::new(hash_map));
+    let app_state = AppState::new();
+    let mut handles = vec![];
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                println!("accepted new connection");
-                thread::spawn(move || {
-                    handle_response(stream, hashmap);
+                let map = Arc::clone(&app_state.db);
+                let handle = thread::spawn(move || {
+                    handle_response(stream, map);
                 });
+
+                handles.push(handle);
             }
             Err(e) => {
                 println!("error: {}", e);
@@ -31,7 +73,7 @@ fn main() {
     }
 }
 
-fn handle_response(mut stream: TcpStream, mut hashmap: HashMap<String, String>) {
+fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
     loop {
         let mut buf = [0; 512];
         let size = stream.read(&mut buf).unwrap();
@@ -41,12 +83,12 @@ fn handle_response(mut stream: TcpStream, mut hashmap: HashMap<String, String>) 
         let command = command_parser(buf);
         match command {
             Ok(mut command) => {
+                let mut entries = map.lock().unwrap();
                 if command.name == "set" {
-                    hashmap.insert(command.key.clone(), command.value.clone());
+                    entries.set(&command.key, &command.value);
                 }
                 if command.name == "get" {
-                    let value = hashmap.get(&command.key).unwrap();
-                    command.value = value.clone();
+                    command.value = entries.get(&command.key);
                 }
                 let _ = stream.write_all(command.response().as_bytes());
             },
