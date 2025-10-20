@@ -107,7 +107,8 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
     let mut command = Command {
         name: String::new(),
         key: String::new(),
-        value: String::new()
+        value: String::new(),
+        option: None,
     };
 
     for i in 0..number_of_elements {
@@ -170,7 +171,13 @@ enum CommandParserErr {
 struct Command {
     name: String,
     key: String,
-    value: String
+    value: String,
+    option: Option<CommandOption>,
+}
+
+struct CommandOption {
+    key: String,
+    value: String,
 }
 
 impl Command {
