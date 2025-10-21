@@ -1,5 +1,5 @@
 #![allow(unused_imports)]
-use std::collections::{HashMap};
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 
 const CRLF_TERMINATOR_LEN: usize = 2;
 
-const SUPPORT_COMMANDS: [&str; 4] = ["ping", "echo", "set", "get"];
+const SUPPORT_COMMANDS: [&str; 5] = ["ping", "echo", "set", "get", "rpush"];
 
 const SUPPORT_OPTION: [&str; 8] = ["ex", "px", "exat", "pxat", "nx", "xx", "keepttl", "get"];
 
@@ -47,23 +47,16 @@ impl DB {
         self.entries.insert(key.to_string(), entry);
     }
 
-    pub fn get(&mut self, key: &String) -> String {
-        let value = self.entries.get(key);
-        match value {
-            Some(val) => {
-                match val.expires_at {
-                    Some(expires_at) => {
-                        if (expires_at < SystemTime::now()) {
-                            return String::new();
-                        }
+    pub fn get(&mut self, key: &String) -> Option<&Entry> {
+        let expires_at = self.entries.get(key).and_then(|v| v.expires_at);
+        if let Some(exp) = expires_at {
+            if exp < SystemTime::now() {
+                self.remove(key);
+                return None;
+            }
+        };
 
-                        return val.value.to_string();
-                    },
-                    None => val.value.to_string(),
-                }
-            },
-            None => String::new(),
-        }
+        self.entries.get(key)
     }
 
     pub fn remove(&mut self, key: &String) -> Option<Entry> {
@@ -111,12 +104,23 @@ fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                     entries.set(&command.key, entry);
                 }
                 if command.name == "get" {
-                    command.value = entries.get(&command.key);
+                    match entries.get(&command.key) {
+                        Some(entry) => {
+                            command.value = entry.value.clone();
+                        },
+                        None => {
+                            command.value = EntryValue::String(String::new());
+                        },
+                    };
+                }
+                if command.name == "rpush" {
+                    let entry = Entry { value: command.value.clone(), expires_at: None };
+                    entries.set(&command.key, entry);
                 }
                 let _ = stream.write_all(command.response().as_bytes());
             },
             Err(e) => {
-                println!("error: {:?}", e);
+                let _ = stream.write_all(String::from("-ERR unknown command\r\n").as_bytes());
             }
         }
     }
@@ -124,13 +128,14 @@ fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
 
 fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
     let number_of_elements = asc2_to_decimal(buf[1]);
+
     // First byte: '*' 
     // Second byte: number of elements
     let mut index = 2 + CRLF_TERMINATOR_LEN;
     let mut command = Command {
         name: String::new(),
         key: String::new(),
-        value: String::new(),
+        value: EntryValue::String(String::new()),
         option: None,
         expires_at: None,
     };
@@ -142,44 +147,54 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
         index += CRLF_TERMINATOR_LEN + 1;
         let value = str::from_utf8(&buf[index..index + len]).unwrap().to_lowercase();
 
-        if SUPPORT_COMMANDS.contains(&value.as_str()) {
-            command.name = value
+        if i == 0 && !SUPPORT_COMMANDS.contains(&value.as_str()) {
+            return Err(CommandParserErr::UnknowCommand);
+        }
+
+        if i == 0 {
+            command.name = value;
+            if command.name == "rpush" {
+                command.value = EntryValue::List(vec![]);
+            }
+        } else if i == 1 {
+            command.key = value;
         } else {
-            if command.name.is_empty() {
-                return Err(CommandParserErr::UnknowCommand);
-            }
-
-            if i == 1 {
-                command.key = value.clone();
-            }
-
-            if i == 2 {
-                command.value = value.clone();
-            }
-
-            if i == 3 {
-                let opt = command.option.get_or_insert_with(|| CommandOption { key: String::new(), value: String::new() });
-                if !SUPPORT_OPTION.contains(&value.as_str()) {
-                    return Err(CommandParserErr::InvalidOption)
+            if command.name == "get" || command.name == "set" {
+                if i == 2 {
+                    let entry_value = EntryValue::String(value.clone());
+                    command.value = entry_value;
                 }
-                opt.key = value.clone();
-            }
-
-            if i == 4 {
-                let opt = command.option.get_or_insert_with(|| CommandOption { key: String::new(), value: String::new() });
-                let value_i = match value.parse::<u64>() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return Err(CommandParserErr::InvalidOption);
+                
+                if i == 3 {
+                    let opt = command.option.get_or_insert_with(|| CommandOption { key: String::new(), value: String::new() });
+                    if !SUPPORT_OPTION.contains(&value.as_str()) {
+                        return Err(CommandParserErr::InvalidOption)
                     }
-                };
-                if opt.get_key() == "ex" {
-                    command.expires_at = Some(SystemTime::now() + Duration::from_secs(value_i));
+                    opt.key = value.clone();
                 }
-                if opt.get_key() == "px" {
-                    command.expires_at = Some(SystemTime::now() + Duration::from_millis(value_i));
+
+                if i == 4 {
+                    let opt = command.option.get_or_insert_with(|| CommandOption { key: String::new(), value: String::new() });
+                    let value_i = match value.parse::<u64>() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Err(CommandParserErr::InvalidOption);
+                        }
+                    };
+                    if opt.get_key() == "ex" {
+                        command.expires_at = Some(SystemTime::now() + Duration::from_secs(value_i));
+                    }
+                    if opt.get_key() == "px" {
+                        command.expires_at = Some(SystemTime::now() + Duration::from_millis(value_i));
+                    }
+                    opt.value = value.clone();
                 }
-                opt.value = value.clone();
+            }
+
+            if command.name == "rpush" {
+                if let EntryValue::List(list) = &mut command.value {
+                    list.push(value);
+                }
             }
         }
 
@@ -218,22 +233,42 @@ enum CommandParserErr {
     InvalidOption,
 }
 
+#[derive(Debug, Clone)]
 struct Command {
     name: String,
     key: String,
-    value: String,
+    value: EntryValue,
     option: Option<CommandOption>,
     expires_at: Option<SystemTime>,
 }
 
+#[derive(Debug, Clone)]
 struct CommandOption {
     key: String,
     value: String,
 }
 
+#[derive(Debug, Clone)]
 struct Entry {
-    value: String,
+    value: EntryValue,
     expires_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+enum EntryValue {
+    String(String),
+    List(Vec<String>),
+    Map(HashMap<String, String>),
+    Set(Vec<String>),
+}
+
+impl EntryValue {
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            EntryValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 impl Command {
@@ -242,12 +277,22 @@ impl Command {
             "ping" => String::from("+PONG\r\n"),
             "echo" => format!("${}\r\n{}\r\n", self.key.len(), self.key),
             "get"  => {
-                if self.value.is_empty() {
-                    return String::from("$-1\r\n");
+                if let EntryValue::String(val) = &self.value {
+                    if val.is_empty() {
+                        return String::from("$-1\r\n");
+                    }
+
+                    return format!("${}\r\n{}\r\n", val.len(), val);
+                }
+                String::from("-ERR some error\r\n")
+            },
+            "rpush" => {
+                if let EntryValue::List(list) = &self.value {
+                    return format!(":{}\r\n", list.len());
                 }
 
-                format!("${}\r\n{}\r\n", self.value.len(), self.value)
-            },
+                String::from("-ERR some error\r\n")
+            }
             "set"  => String::from("+OK\r\n"),
             _      => String::from("-ERR unknown command\r\n"),
         }
