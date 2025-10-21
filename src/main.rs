@@ -59,6 +59,23 @@ impl DB {
         self.entries.get(key)
     }
 
+    pub fn rpush(&mut self, key: &String, values: Vec<String>) {
+        self.entries
+            .entry(key.to_string())
+            .and_modify(|entry| {
+                if let EntryValue::List(ref mut list) = entry.value {
+                    println!("here");
+                    list.extend(values.clone());
+                } else {
+                    entry.value = EntryValue::List(values.clone());
+                }
+            })
+            .or_insert_with(|| Entry {
+                value: EntryValue::List(values),
+                expires_at: None,
+            });
+    }
+
     pub fn remove(&mut self, key: &String) -> Option<Entry> {
         self.entries.remove(key)
     }
@@ -114,8 +131,9 @@ fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                     };
                 }
                 if command.name == "rpush" {
-                    let entry = Entry { value: command.value.clone(), expires_at: None };
-                    entries.set(&command.key, entry);
+                    if let EntryValue::List(list) = command.value.clone() {
+                        entries.rpush(&command.key, list);
+                    }
                 }
                 let _ = stream.write_all(command.response().as_bytes());
             },
