@@ -1,5 +1,5 @@
 #![allow(unused_imports)]
-use std::collections::{HashMap, VecDeque};
+use std::collections::{vec_deque, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 
 const CRLF_TERMINATOR_LEN: usize = 2;
 
-const SUPPORT_COMMANDS: [&str; 6] = ["ping", "echo", "set", "get", "rpush", "lrange"];
+const SUPPORT_COMMANDS: [&str; 7] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange"];
 
 const SUPPORT_OPTION: [&str; 8] = ["ex", "px", "exat", "pxat", "nx", "xx", "keepttl", "get"];
 
@@ -59,7 +59,7 @@ impl DB {
         self.entries.get(key)
     }
 
-    pub fn rpush(&mut self, key: &String, values: Vec<String>) -> usize {
+    pub fn rpush(&mut self, key: &String, values: VecDeque<String>) -> usize {
         self.entries
             .entry(key.to_string())
             .and_modify(|entry| {
@@ -71,6 +71,32 @@ impl DB {
             })
             .or_insert_with(|| Entry {
                 value: EntryValue::List(values),
+                expires_at: None,
+            });
+
+        if let Some(entry) = self.entries.get(key) {
+            if let EntryValue::List(list) = &entry.value {
+                return list.len();
+            }
+        }
+
+        0
+    }
+
+    pub fn lpush(&mut self, key: &String, values: VecDeque<String>) -> usize {
+        self.entries
+            .entry(key.to_string())
+            .and_modify(|entry| {
+                if let EntryValue::List(ref mut list) = entry.value {
+                    for s in values.iter() {
+                        list.push_front(s.to_string());
+                    }
+                } else {
+                    println!("Err");
+                }
+            })
+            .or_insert_with(|| Entry {
+                value: EntryValue::List(values.into_iter().rev().collect()),
                 expires_at: None,
             });
 
@@ -154,6 +180,15 @@ fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                         }
                     },
 
+                    "lpush" => {
+                        if let EntryValue::List(list) = command.value.clone() {
+                            let len = entries.lpush(&command.key, list);
+                            format!(":{}\r\n", len)
+                        } else {
+                            "-ERR wrong type\r\n".to_string()
+                        }
+                    }
+
                     "lrange" => {
                         match command.lrange_option {
                             Some(mut option) => {
@@ -175,9 +210,9 @@ fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                                                 if option.start > option.stop {
                                                     "*0\r\n".to_string()
                                                 } else {
-                                                    let slice = &list[option.start as usize..(option.stop + 1) as usize];
+                                                    let slice = list.range(option.start as usize..=option.stop as usize);
                                                     let mut result = format!("*{}\r\n", slice.len());
-                                                    for s in slice.iter() {
+                                                    for s in slice {
                                                         result.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
                                                     }
                                                     result
@@ -234,8 +269,8 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
 
         if i == 0 {
             command.name = value;
-            if command.name == "rpush" {
-                command.value = EntryValue::List(vec![]);
+            if command.name == "rpush" || command.name == "lpush" {
+                command.value = EntryValue::List(VecDeque::new());
             }
         } else if i == 1 {
             command.key = value;
@@ -272,9 +307,9 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
                 }
             }
 
-            if command.name == "rpush" {
+            if command.name == "rpush" || command.name == "lpush" {
                 if let EntryValue::List(list) = &mut command.value {
-                    list.push(value.clone());
+                    list.push_back(value.clone());
                 }
             }
 
@@ -366,7 +401,7 @@ struct Entry {
 #[derive(Debug, Clone)]
 enum EntryValue {
     String(String),
-    List(Vec<String>),
+    List(VecDeque<String>),
     Map(HashMap<String, String>),
     Set(Vec<String>),
 }
