@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 
 const CRLF_TERMINATOR_LEN: usize = 2;
 
-const SUPPORT_COMMANDS: [&str; 5] = ["ping", "echo", "set", "get", "rpush"];
+const SUPPORT_COMMANDS: [&str; 6] = ["ping", "echo", "set", "get", "rpush", "lrange"];
 
 const SUPPORT_OPTION: [&str; 8] = ["ex", "px", "exat", "pxat", "nx", "xx", "keepttl", "get"];
 
@@ -152,6 +152,45 @@ fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                         } else {
                             "-ERR wrong type\r\n".to_string()
                         }
+                    },
+
+                    "lrange" => {
+                        match command.lrange_option {
+                            Some(mut option) => {
+                                match entries.get(&command.key) {
+                                    Some(entry) => {
+                                        if let EntryValue::List(list) = &entry.value {
+                                            let len = list.len() as i32;
+
+                                            if option.start >= len {
+                                                "*0\r\n".to_string()
+                                            } else {
+                                                option.start = if option.start < 0 { len + option.start } else { option.start };
+                                                option.stop  = if option.stop  < 0 { len + option.stop  } else { option.stop  };
+
+                                                if option.stop >= len { option.stop = len - 1; }
+                                                if option.stop < 0 { option.stop = 0; }
+
+                                                if option.start > option.stop {
+                                                    "*0\r\n".to_string()
+                                                } else {
+                                                    let slice = &list[option.start as usize..(option.stop + 1) as usize];
+                                                    let mut result = format!("*{}\r\n", slice.len());
+                                                    for s in slice.iter() {
+                                                        result.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
+                                                    }
+                                                    result
+                                                }
+                                            }
+                                        } else {
+                                            "*0\r\n".to_string()
+                                        }
+                                    }
+                                    None => "*0\r\n".to_string(),
+                                }
+                            }
+                            None => "-ERR missing parameter\r\n".to_string(),
+                        }
                     }
 
                     _ => "-ERR unknown command\r\n".to_string(),
@@ -178,6 +217,7 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
         value: EntryValue::String(String::new()),
         option: None,
         expires_at: None,
+        lrange_option: None,
     };
 
     for i in 0..number_of_elements {
@@ -233,7 +273,29 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
 
             if command.name == "rpush" {
                 if let EntryValue::List(list) = &mut command.value {
-                    list.push(value);
+                    list.push(value.clone());
+                }
+            }
+
+            if command.name == "lrange" {
+                if i == 2 {
+                    let opt = command.lrange_option.get_or_insert_with(|| LRangeOption { start: 0, stop: 0 });
+                    opt.start = match value.parse::<i32>() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Err(CommandParserErr::InvalidOption);
+                        }
+                    };
+                }
+
+                if i == 3 {
+                    let opt = command.lrange_option.get_or_insert_with(|| LRangeOption { start: 0, stop: 0 });
+                    opt.stop = match value.parse::<i32>() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Err(CommandParserErr::InvalidOption);
+                        }
+                    };
                 }
             }
         }
@@ -279,12 +341,19 @@ struct Command {
     value: EntryValue,
     option: Option<CommandOption>,
     expires_at: Option<SystemTime>,
+    lrange_option: Option<LRangeOption>,
 }
 
 #[derive(Debug, Clone)]
 struct CommandOption {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Clone)]
+struct LRangeOption {
+    start: i32,
+    stop: i32,
 }
 
 #[derive(Debug, Clone)]
