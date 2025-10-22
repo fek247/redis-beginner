@@ -169,6 +169,7 @@ fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                                                 option.stop  = if option.stop  < 0 { len + option.stop  } else { option.stop  };
 
                                                 if option.stop >= len { option.stop = len - 1; }
+                                                if option.start < 0 { option.start = 0; }
                                                 if option.stop < 0 { option.stop = 0; }
 
                                                 if option.start > option.stop {
