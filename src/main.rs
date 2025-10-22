@@ -59,12 +59,11 @@ impl DB {
         self.entries.get(key)
     }
 
-    pub fn rpush(&mut self, key: &String, values: Vec<String>) {
+    pub fn rpush(&mut self, key: &String, values: Vec<String>) -> usize {
         self.entries
             .entry(key.to_string())
             .and_modify(|entry| {
                 if let EntryValue::List(ref mut list) = entry.value {
-                    println!("here");
                     list.extend(values.clone());
                 } else {
                     entry.value = EntryValue::List(values.clone());
@@ -74,6 +73,14 @@ impl DB {
                 value: EntryValue::List(values),
                 expires_at: None,
             });
+
+        if let Some(entry) = self.entries.get(key) {
+            if let EntryValue::List(list) = &entry.value {
+                return list.len();
+            }
+        }
+
+        0
     }
 
     pub fn remove(&mut self, key: &String) -> Option<Entry> {
@@ -114,30 +121,45 @@ fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
         }
         let command = command_parser(buf);
         match command {
-            Ok(mut command) => {
+            Ok(command) => {
                 let mut entries = map.lock().unwrap();
-                if command.name == "set" {
-                    let entry = Entry { value: command.value.clone(), expires_at: command.expires_at };
-                    entries.set(&command.key, entry);
-                }
-                if command.name == "get" {
-                    match entries.get(&command.key) {
-                        Some(entry) => {
-                            command.value = entry.value.clone();
+                let response = match command.name.as_str() {
+                    "ping" => "+PONG\r\n".to_string(),
+
+                    "echo" => format!("${}\r\n{}\r\n", command.key.len(), command.key),
+
+                    "set" => {
+                        let entry = Entry { 
+                            value: command.value.clone(), 
+                            expires_at: command.expires_at 
+                        };
+                        entries.set(&command.key, entry);
+                        "+OK\r\n".to_string()
+                    },
+
+                    "get" => match entries.get(&command.key) {
+                        Some(entry) => match &entry.value {
+                            EntryValue::String(s) => format!("${}\r\n{}\r\n", s.len(), s),
+                            _ => "$-1\r\n".to_string(),
                         },
-                        None => {
-                            command.value = EntryValue::String(String::new());
-                        },
-                    };
-                }
-                if command.name == "rpush" {
-                    if let EntryValue::List(list) = command.value.clone() {
-                        entries.rpush(&command.key, list);
+                        None => "$-1\r\n".to_string(),
+                    },
+
+                    "rpush" => {
+                        if let EntryValue::List(list) = command.value.clone() {
+                            let len = entries.rpush(&command.key, list);
+                            format!(":{}\r\n", len)
+                        } else {
+                            "-ERR wrong type\r\n".to_string()
+                        }
                     }
-                }
-                let _ = stream.write_all(command.response().as_bytes());
+
+                    _ => "-ERR unknown command\r\n".to_string(),
+                };
+
+                let _  = stream.write_all(response.as_bytes());
             },
-            Err(e) => {
+            Err(_e) => {
                 let _ = stream.write_all(String::from("-ERR unknown command\r\n").as_bytes());
             }
         }
@@ -246,7 +268,6 @@ fn read_length(buf: &[u8], index: &mut usize) -> Result<usize, &'static str> {
 
 #[derive(Debug)]
 enum CommandParserErr {
-    InvalidFormat,
     UnknowCommand,
     InvalidOption,
 }
@@ -280,49 +301,8 @@ enum EntryValue {
     Set(Vec<String>),
 }
 
-impl EntryValue {
-    pub fn as_str(&self) -> Option<&str> {
-        match self {
-            EntryValue::String(s) => Some(s),
-            _ => None,
-        }
-    }
-}
-
-impl Command {
-    pub fn response(&self) -> String {
-        match self.name.as_str() {
-            "ping" => String::from("+PONG\r\n"),
-            "echo" => format!("${}\r\n{}\r\n", self.key.len(), self.key),
-            "get"  => {
-                if let EntryValue::String(val) = &self.value {
-                    if val.is_empty() {
-                        return String::from("$-1\r\n");
-                    }
-
-                    return format!("${}\r\n{}\r\n", val.len(), val);
-                }
-                String::from("-ERR some error\r\n")
-            },
-            "rpush" => {
-                if let EntryValue::List(list) = &self.value {
-                    return format!(":{}\r\n", list.len());
-                }
-
-                String::from("-ERR some error\r\n")
-            }
-            "set"  => String::from("+OK\r\n"),
-            _      => String::from("-ERR unknown command\r\n"),
-        }
-    }
-}
-
 impl CommandOption {
     pub fn get_key(&self) -> String {
         self.key.clone()
-    }
-
-    pub fn get_value(&self) -> String {
-        self.value.clone()
     }
 }
