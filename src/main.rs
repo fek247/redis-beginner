@@ -12,7 +12,7 @@ const CRLF_TERMINATOR_LEN: usize = 2;
 
 const SUPPORT_COMMANDS: [&str; 9] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange", "llen", "lpop"];
 
-const SUPPORT_OPTION: [&str; 8] = ["ex", "px", "exat", "pxat", "nx", "xx", "keepttl", "get"];
+const SET_SUPPORT_OPTION: [&str; 8] = ["ex", "px", "exat", "pxat", "nx", "xx", "keepttl", "get"];
 
 struct AppState {
     db: Arc<Mutex<DB>>,
@@ -182,9 +182,19 @@ fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                     "echo" => format!("${}\r\n{}\r\n", command.key.len(), command.key),
 
                     "set" => {
-                        let entry = Entry { 
+                        let expires_at = match command.option {
+                            Some(opt) => {
+                                if let CommandOption::Set(set_opt) = opt {
+                                    Some(set_opt.expires_at)
+                                } else {
+                                    None
+                                }
+                            },
+                            None => None,
+                        };
+                        let entry = Entry {
                             value: command.value.clone(), 
-                            expires_at: command.expires_at 
+                            expires_at,
                         };
                         entries.set(&command.key, entry);
                         "+OK\r\n".to_string()
@@ -217,8 +227,8 @@ fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                     }
 
                     "lrange" => {
-                        match command.lrange_option {
-                            Some(mut option) => {
+                        match command.option {
+                            Some(CommandOption::LRange(mut option)) => {
                                 match entries.get(&command.key) {
                                     Some(entry) => {
                                         if let EntryValue::List(list) = &entry.value {
@@ -251,7 +261,8 @@ fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                                     }
                                     None => "*0\r\n".to_string(),
                                 }
-                            }
+                            },
+                            Some(_) => "-ERR wrong command option type\r\n".to_string(),
                             None => "-ERR missing parameter\r\n".to_string(),
                         }
                     }
@@ -270,30 +281,35 @@ fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                     }
 
                     "lpop" => {
-                        let count = match command.lpop_option {
-                            Some(option) => option.count,
-                            None => 1
+                        let (count, wrong_type)  = match command.option {
+                            Some(CommandOption::LPop(option)) => (option.count, false),
+                            Some(_) => (1, true),
+                            None => (1, false)
                         };
 
-                        match entries.lpop(&command.key, count) {
-                            Ok(list) => {
-                                match list.len() {
-                                    0 => {
-                                        "$-1\r\n".to_string()
-                                    },
-                                    1 => {
-                                        format!("${}\r\n{}\r\n", list[0].len(), list[0])
-                                    },
-                                    _ => {
-                                        let mut result = format!("*{}\r\n", list.len());
-                                        for s in list {
-                                            result.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
+                        if wrong_type {
+                            "-ERR wrong command option type\r\n".to_string()
+                        } else {
+                            match entries.lpop(&command.key, count) {
+                                Ok(list) => {
+                                    match list.len() {
+                                        0 => {
+                                            "$-1\r\n".to_string()
+                                        },
+                                        1 => {
+                                            format!("${}\r\n{}\r\n", list[0].len(), list[0])
+                                        },
+                                        _ => {
+                                            let mut result = format!("*{}\r\n", list.len());
+                                            for s in list {
+                                                result.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
+                                            }
+                                            result
                                         }
-                                        result
                                     }
-                                }
-                            },
-                            Err(e) => "-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_string(),
+                                },
+                                Err(e) => "-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_string(),
+                            }
                         }
                     }
 
@@ -320,9 +336,6 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
         key: String::new(),
         value: EntryValue::String(String::new()),
         option: None,
-        expires_at: None,
-        lrange_option: None,
-        lpop_option: None,
     };
 
     for i in 0..number_of_elements {
@@ -351,28 +364,42 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
                 }
                 
                 if i == 3 {
-                    let opt = command.option.get_or_insert_with(|| CommandOption { key: String::new(), value: String::new() });
-                    if !SUPPORT_OPTION.contains(&value.as_str()) {
+                    let opt = command.option.get_or_insert_with(|| CommandOption::Set(SetOption {
+                        key: String::new(),
+                        value: String::new(),
+                        expires_at: SystemTime::now(),
+                    }));
+                    if !SET_SUPPORT_OPTION.contains(&value.as_str()) {
                         return Err(CommandParserErr::InvalidOption)
                     }
-                    opt.key = value.clone();
+
+                    if let CommandOption::Set(opt) = opt {
+                        opt.set_key(value.clone());
+                    }
                 }
 
                 if i == 4 {
-                    let opt = command.option.get_or_insert_with(|| CommandOption { key: String::new(), value: String::new() });
+                    let opt = command.option.get_or_insert_with(|| CommandOption::Set(SetOption {
+                        key: String::new(),
+                        value: String::new(),
+                        expires_at: SystemTime::now(),
+                    }));
                     let value_i = match value.parse::<u64>() {
                         Ok(v) => v,
                         Err(e) => {
                             return Err(CommandParserErr::InvalidOption);
                         }
                     };
-                    if opt.get_key() == "ex" {
-                        command.expires_at = Some(SystemTime::now() + Duration::from_secs(value_i));
+                    if let CommandOption::Set(set_opt) = opt {
+                        if set_opt.get_key() == "ex" {
+                            set_opt.expires_at = SystemTime::now() + Duration::from_secs(value_i);
+                        }
+                        if set_opt.get_key() == "px" {
+                            set_opt.expires_at = SystemTime::now() + Duration::from_millis(value_i);
+                        }
+                        set_opt.set_value(value.clone());
                     }
-                    if opt.get_key() == "px" {
-                        command.expires_at = Some(SystemTime::now() + Duration::from_millis(value_i));
-                    }
-                    opt.value = value.clone();
+
                 }
             }
 
@@ -384,23 +411,27 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
 
             if command.name == "lrange" {
                 if i == 2 {
-                    let opt = command.lrange_option.get_or_insert_with(|| LRangeOption { start: 0, stop: 0 });
-                    opt.start = match value.parse::<i32>() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            return Err(CommandParserErr::InvalidOption);
-                        }
-                    };
+                    let opt = command.option.get_or_insert_with(|| CommandOption::LRange(LRangeOption { start: 0, stop: 0 }));
+                    if let CommandOption::LRange(lrange_opt) = opt {
+                        lrange_opt.start = match value.parse::<i32>() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return Err(CommandParserErr::InvalidOption);
+                            }
+                        };
+                    }
                 }
 
                 if i == 3 {
-                    let opt = command.lrange_option.get_or_insert_with(|| LRangeOption { start: 0, stop: 0 });
-                    opt.stop = match value.parse::<i32>() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            return Err(CommandParserErr::InvalidOption);
-                        }
-                    };
+                    let opt = command.option.get_or_insert_with(|| CommandOption::LRange(LRangeOption { start: 0, stop: 0 }));
+                    if let CommandOption::LRange(lrange_opt) = opt {
+                        lrange_opt.stop = match value.parse::<i32>() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return Err(CommandParserErr::InvalidOption);
+                            }
+                        };
+                    }
                 }
             }
 
@@ -412,7 +443,7 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
                             return Err(CommandParserErr::InvalidOption);
                         }
                     };
-                    command.lpop_option = Some(LPopOption { count: count });
+                    command.option = Some(CommandOption::LPop(LPopOption { count: count }));
                 }
             }
         }
@@ -461,15 +492,19 @@ struct Command {
     key: String,
     value: EntryValue,
     option: Option<CommandOption>,
-    expires_at: Option<SystemTime>,
-    lrange_option: Option<LRangeOption>,
-    lpop_option: Option<LPopOption>,
 }
 
 #[derive(Debug, Clone)]
-struct CommandOption {
+enum CommandOption {
+    Set(SetOption),
+    LRange(LRangeOption),
+    LPop(LPopOption),
+}
+#[derive(Debug, Clone)]
+struct SetOption {
     key: String,
     value: String,
+    expires_at: SystemTime,
 }
 
 #[derive(Debug, Clone)]
@@ -497,8 +532,16 @@ enum EntryValue {
     Set(Vec<String>),
 }
 
-impl CommandOption {
+impl SetOption {
     pub fn get_key(&self) -> String {
         self.key.clone()
+    }
+
+    pub fn set_key(&mut self, key: String) {
+        self.key = key;
+    }
+
+    pub fn set_value(&mut self, value: String) {
+        self.value = value;
     }
 }
