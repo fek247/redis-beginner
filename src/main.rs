@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 
 const CRLF_TERMINATOR_LEN: usize = 2;
 
-const SUPPORT_COMMANDS: [&str; 8] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange", "llen"];
+const SUPPORT_COMMANDS: [&str; 9] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange", "llen", "lpop"];
 
 const SUPPORT_OPTION: [&str; 8] = ["ex", "px", "exat", "pxat", "nx", "xx", "keepttl", "get"];
 
@@ -107,6 +107,33 @@ impl DB {
         }
 
         0
+    }
+
+    pub fn lpop(&mut self, key: &String, mut count: usize) -> Result<Vec<String>, OperationErr> {
+        let entry = self.entries.get_mut(key);
+        match entry {
+            Some(entry) => {
+                if let EntryValue::List(ref mut list ) = entry.value {
+                    let len = list.len();
+                    if count > len {
+                        count = len;
+                    }
+
+                    let mut result = Vec::<String>::new();
+                    for _i in 0..count {
+                        // Unwrap here because already validate index
+                        result.push(list.pop_front().unwrap());
+                    }
+
+                    Ok(result)
+                } else {
+                    return Err(OperationErr::WrongType);
+                }
+            },
+            None => {
+                return Ok(vec![]);
+            }
+        }
     }
 
     pub fn remove(&mut self, key: &String) -> Option<Entry> {
@@ -242,6 +269,34 @@ fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                         }
                     }
 
+                    "lpop" => {
+                        let count = match command.lpop_option {
+                            Some(option) => option.count,
+                            None => 1
+                        };
+
+                        match entries.lpop(&command.key, count) {
+                            Ok(list) => {
+                                match list.len() {
+                                    0 => {
+                                        "$-1\r\n".to_string()
+                                    },
+                                    1 => {
+                                        format!("${}\r\n{}\r\n", list[0].len(), list[0])
+                                    },
+                                    _ => {
+                                        let mut result = format!("*{}\r\n", list.len());
+                                        for s in list {
+                                            result.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
+                                        }
+                                        result
+                                    }
+                                }
+                            },
+                            Err(e) => "-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_string(),
+                        }
+                    }
+
                     _ => "-ERR unknown command\r\n".to_string(),
                 };
 
@@ -267,6 +322,7 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
         option: None,
         expires_at: None,
         lrange_option: None,
+        lpop_option: None,
     };
 
     for i in 0..number_of_elements {
@@ -347,6 +403,18 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
                     };
                 }
             }
+
+            if command.name == "lpop" {
+                if i == 2 {
+                    let count = match value.parse::<usize>() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Err(CommandParserErr::InvalidOption);
+                        }
+                    };
+                    command.lpop_option = Some(LPopOption { count: count });
+                }
+            }
         }
 
         index += len + CRLF_TERMINATOR_LEN;
@@ -383,6 +451,10 @@ enum CommandParserErr {
     InvalidOption,
 }
 
+enum OperationErr {
+    WrongType,
+}
+
 #[derive(Debug, Clone)]
 struct Command {
     name: String,
@@ -391,6 +463,7 @@ struct Command {
     option: Option<CommandOption>,
     expires_at: Option<SystemTime>,
     lrange_option: Option<LRangeOption>,
+    lpop_option: Option<LPopOption>,
 }
 
 #[derive(Debug, Clone)]
@@ -403,6 +476,11 @@ struct CommandOption {
 struct LRangeOption {
     start: i32,
     stop: i32,
+}
+
+#[derive(Debug, Clone)]
+struct LPopOption {
+    count: usize,
 }
 
 #[derive(Debug, Clone)]
