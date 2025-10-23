@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 
 const CRLF_TERMINATOR_LEN: usize = 2;
 
-const SUPPORT_COMMANDS: [&str; 7] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange"];
+const SUPPORT_COMMANDS: [&str; 8] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange", "llen"];
 
 const SUPPORT_OPTION: [&str; 8] = ["ex", "px", "exat", "pxat", "nx", "xx", "keepttl", "get"];
 
@@ -226,6 +226,19 @@ fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                                 }
                             }
                             None => "-ERR missing parameter\r\n".to_string(),
+                        }
+                    }
+
+                    "llen" => {
+                        match entries.get(&command.key) {
+                            Some(entry) => {
+                                if let EntryValue::List(list) = &entry.value {
+                                    format!(":{}\r\n", list.len())
+                                } else {
+                                    ":0\r\n".to_string()
+                                }
+                            },
+                            None => ":0\r\n".to_string(),
                         }
                     }
 
