@@ -1,16 +1,18 @@
 #![allow(unused_imports)]
 use std::collections::{vec_deque, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::spawn;
 use tokio::sync::Notify;
 
 const CRLF_TERMINATOR_LEN: usize = 2;
 
-const SUPPORT_COMMANDS: [&str; 9] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange", "llen", "lpop"];
+const SUPPORT_COMMANDS: [&str; 10] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange", "llen", "lpop", "blpop"];
 
 const SET_SUPPORT_OPTION: [&str; 8] = ["ex", "px", "exat", "pxat", "nx", "xx", "keepttl", "get"];
 
@@ -136,190 +138,224 @@ impl DB {
         }
     }
 
+    pub fn blpop(&mut self, keys: VecDeque<String>, timeout: f32) -> (String, String) {
+        let mut result: (String, String) = (String::new(), String::new());
+
+        for key in keys {
+            let entry = self.entries.get_mut(&key);
+            if let Some(entry) = entry {
+                if let EntryValue::List(ref mut list) = entry.value {
+                    if let Some(element) = list.pop_front() {
+                        result = (key, element);
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
     pub fn remove(&mut self, key: &String) -> Option<Entry> {
         self.entries.remove(key)
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     println!("Logs from your program will appear here!");
 
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
     let app_state = AppState::new();
-    let mut handles = vec![];
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let map = Arc::clone(&app_state.db);
-                let handle = thread::spawn(move || {
-                    handle_response(stream, map);
-                });
-
-                handles.push(handle);
-            }
-            Err(e) => {
-                println!("error: {}", e);
-            }
-        }
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let map = Arc::clone(&app_state.db);
+        tokio::spawn(async move {
+            handle_response(stream, map).await;
+        });
     }
 }
 
-fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
+async fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
     loop {
         let mut buf = [0; 512];
-        let size = stream.read(&mut buf).unwrap();
+        let size = stream.read(&mut buf).await.unwrap();
         if size <= 0 {
             break;
         }
         let command = command_parser(buf);
         match command {
             Ok(command) => {
-                let mut entries = map.lock().unwrap();
-                let response = match command.name.as_str() {
-                    "ping" => "+PONG\r\n".to_string(),
+                let response: String;
+                {
+                    let mut entries = map.lock().unwrap();
+                    response = match command.name.as_str() {
+                        "ping" => "+PONG\r\n".to_string(),
 
-                    "echo" => format!("${}\r\n{}\r\n", command.key.len(), command.key),
+                        "echo" => format!("${}\r\n{}\r\n", command.key.len(), command.key),
 
-                    "set" => {
-                        let expires_at = match command.option {
-                            Some(opt) => {
-                                if let CommandOption::Set(set_opt) = opt {
-                                    Some(set_opt.expires_at)
-                                } else {
-                                    None
-                                }
-                            },
-                            None => None,
-                        };
-                        let entry = Entry {
-                            value: command.value.clone(), 
-                            expires_at,
-                        };
-                        entries.set(&command.key, entry);
-                        "+OK\r\n".to_string()
-                    },
-
-                    "get" => match entries.get(&command.key) {
-                        Some(entry) => match &entry.value {
-                            EntryValue::String(s) => format!("${}\r\n{}\r\n", s.len(), s),
-                            _ => "$-1\r\n".to_string(),
-                        },
-                        None => "$-1\r\n".to_string(),
-                    },
-
-                    "rpush" => {
-                        if let EntryValue::List(list) = command.value.clone() {
-                            let len = entries.rpush(&command.key, list);
-                            format!(":{}\r\n", len)
-                        } else {
-                            "-ERR wrong type\r\n".to_string()
-                        }
-                    },
-
-                    "lpush" => {
-                        if let EntryValue::List(list) = command.value.clone() {
-                            let len = entries.lpush(&command.key, list);
-                            format!(":{}\r\n", len)
-                        } else {
-                            "-ERR wrong type\r\n".to_string()
-                        }
-                    }
-
-                    "lrange" => {
-                        match command.option {
-                            Some(CommandOption::LRange(mut option)) => {
-                                match entries.get(&command.key) {
-                                    Some(entry) => {
-                                        if let EntryValue::List(list) = &entry.value {
-                                            let len = list.len() as i32;
-
-                                            if option.start >= len {
-                                                "*0\r\n".to_string()
-                                            } else {
-                                                option.start = if option.start < 0 { len + option.start } else { option.start };
-                                                option.stop  = if option.stop  < 0 { len + option.stop  } else { option.stop  };
-
-                                                if option.stop >= len { option.stop = len - 1; }
-                                                if option.start < 0 { option.start = 0; }
-                                                if option.stop < 0 { option.stop = 0; }
-
-                                                if option.start > option.stop {
-                                                    "*0\r\n".to_string()
-                                                } else {
-                                                    let slice = list.range(option.start as usize..=option.stop as usize);
-                                                    let mut result = format!("*{}\r\n", slice.len());
-                                                    for s in slice {
-                                                        result.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
-                                                    }
-                                                    result
-                                                }
-                                            }
-                                        } else {
-                                            "*0\r\n".to_string()
-                                        }
-                                    }
-                                    None => "*0\r\n".to_string(),
-                                }
-                            },
-                            Some(_) => "-ERR wrong command option type\r\n".to_string(),
-                            None => "-ERR missing parameter\r\n".to_string(),
-                        }
-                    }
-
-                    "llen" => {
-                        match entries.get(&command.key) {
-                            Some(entry) => {
-                                if let EntryValue::List(list) = &entry.value {
-                                    format!(":{}\r\n", list.len())
-                                } else {
-                                    ":0\r\n".to_string()
-                                }
-                            },
-                            None => ":0\r\n".to_string(),
-                        }
-                    }
-
-                    "lpop" => {
-                        let (count, wrong_type)  = match command.option {
-                            Some(CommandOption::LPop(option)) => (option.count, false),
-                            Some(_) => (1, true),
-                            None => (1, false)
-                        };
-
-                        if wrong_type {
-                            "-ERR wrong command option type\r\n".to_string()
-                        } else {
-                            match entries.lpop(&command.key, count) {
-                                Ok(list) => {
-                                    match list.len() {
-                                        0 => {
-                                            "$-1\r\n".to_string()
-                                        },
-                                        1 => {
-                                            format!("${}\r\n{}\r\n", list[0].len(), list[0])
-                                        },
-                                        _ => {
-                                            let mut result = format!("*{}\r\n", list.len());
-                                            for s in list {
-                                                result.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
-                                            }
-                                            result
-                                        }
+                        "set" => {
+                            let expires_at = match command.option {
+                                Some(opt) => {
+                                    if let CommandOption::Set(set_opt) = opt {
+                                        Some(set_opt.expires_at)
+                                    } else {
+                                        None
                                     }
                                 },
-                                Err(e) => "-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_string(),
+                                None => None,
+                            };
+                            let entry = Entry {
+                                value: command.value.clone(), 
+                                expires_at,
+                            };
+                            entries.set(&command.key, entry);
+                            "+OK\r\n".to_string()
+                        },
+
+                        "get" => match entries.get(&command.key) {
+                            Some(entry) => match &entry.value {
+                                EntryValue::String(s) => format!("${}\r\n{}\r\n", s.len(), s),
+                                _ => "$-1\r\n".to_string(),
+                            },
+                            None => "$-1\r\n".to_string(),
+                        },
+
+                        "rpush" => {
+                            if let EntryValue::List(list) = command.value.clone() {
+                                let len = entries.rpush(&command.key, list);
+                                format!(":{}\r\n", len)
+                            } else {
+                                "-ERR wrong type\r\n".to_string()
+                            }
+                        },
+
+                        "lpush" => {
+                            if let EntryValue::List(list) = command.value.clone() {
+                                let len = entries.lpush(&command.key, list);
+                                format!(":{}\r\n", len)
+                            } else {
+                                "-ERR wrong type\r\n".to_string()
                             }
                         }
-                    }
 
-                    _ => "-ERR unknown command\r\n".to_string(),
-                };
+                        "lrange" => {
+                            match command.option {
+                                Some(CommandOption::LRange(mut option)) => {
+                                    match entries.get(&command.key) {
+                                        Some(entry) => {
+                                            if let EntryValue::List(list) = &entry.value {
+                                                let len = list.len() as i32;
 
-                let _  = stream.write_all(response.as_bytes());
+                                                if option.start >= len {
+                                                    "*0\r\n".to_string()
+                                                } else {
+                                                    option.start = if option.start < 0 { len + option.start } else { option.start };
+                                                    option.stop  = if option.stop  < 0 { len + option.stop  } else { option.stop  };
+
+                                                    if option.stop >= len { option.stop = len - 1; }
+                                                    if option.start < 0 { option.start = 0; }
+                                                    if option.stop < 0 { option.stop = 0; }
+
+                                                    if option.start > option.stop {
+                                                        "*0\r\n".to_string()
+                                                    } else {
+                                                        let slice = list.range(option.start as usize..=option.stop as usize);
+                                                        let mut result = format!("*{}\r\n", slice.len());
+                                                        for s in slice {
+                                                            result.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
+                                                        }
+                                                        result
+                                                    }
+                                                }
+                                            } else {
+                                                "*0\r\n".to_string()
+                                            }
+                                        }
+                                        None => "*0\r\n".to_string(),
+                                    }
+                                },
+                                Some(_) => "-ERR wrong command option type\r\n".to_string(),
+                                None => "-ERR missing parameter\r\n".to_string(),
+                            }
+                        }
+
+                        "llen" => {
+                            match entries.get(&command.key) {
+                                Some(entry) => {
+                                    if let EntryValue::List(list) = &entry.value {
+                                        format!(":{}\r\n", list.len())
+                                    } else {
+                                        ":0\r\n".to_string()
+                                    }
+                                },
+                                None => ":0\r\n".to_string(),
+                            }
+                        }
+
+                        "lpop" => {
+                            let (count, wrong_type)  = match command.option {
+                                Some(CommandOption::LPop(option)) => (option.count, false),
+                                Some(_) => (1, true),
+                                None => (1, false)
+                            };
+
+                            if wrong_type {
+                                "-ERR wrong command option type\r\n".to_string()
+                            } else {
+                                match entries.lpop(&command.key, count) {
+                                    Ok(list) => {
+                                        match list.len() {
+                                            0 => {
+                                                "$-1\r\n".to_string()
+                                            },
+                                            1 => {
+                                                format!("${}\r\n{}\r\n", list[0].len(), list[0])
+                                            },
+                                            _ => {
+                                                let mut result = format!("*{}\r\n", list.len());
+                                                for s in list {
+                                                    result.push_str(&format!("${}\r\n{}\r\n", s.len(), s));
+                                                }
+                                                result
+                                            }
+                                        }
+                                    },
+                                    Err(e) => "-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_string(),
+                                }
+                            }
+                        }
+
+                        "blpop" => {
+                            match command.option {
+                                Some(opt) => {
+                                    if let CommandOption::BLPop(blpop_opt) = opt {
+                                        if blpop_opt.timeout != -1.0 {
+                                            if let EntryValue::List(keys) = command.value {
+                                                let (key, value) = entries.blpop(keys, blpop_opt.timeout);
+                                                format!("*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n", key.len(), key, value.len(), value)
+                                            } else {
+                                                "-ERR WRONGTYPE Option\r\n".to_string()
+                                            }
+                                        } else {
+                                            "-ERR missing timeout param\r\n".to_string()
+                                        }
+                                    } else {
+                                        "-ERR WRONGTYPE Option\r\n".to_string()
+                                    }
+                                },
+                                None => "-ERR missing param\r\n".to_string(),
+                            }
+
+                        }
+
+                        _ => "-ERR unknown command\r\n".to_string(),
+                    };
+                }
+
+                let _  = stream.write(response.as_bytes()).await;
             },
             Err(_e) => {
-                let _ = stream.write_all(String::from("-ERR unknown command\r\n").as_bytes());
+                let _ = stream.write(String::from("-ERR unknown command\r\n").as_bytes()).await;
             }
         }
     }
@@ -351,13 +387,15 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
 
         if i == 0 {
             command.name = value;
-            if command.name == "rpush" || command.name == "lpush" {
+            if command.name == "rpush" || command.name == "lpush" || command.name == "blpop" {
                 command.value = EntryValue::List(VecDeque::new());
             }
-        } else if i == 1 {
-            command.key = value;
         } else {
             if command.name == "get" || command.name == "set" {
+                if i == 1 {
+                    command.key = value.clone();
+                }
+
                 if i == 2 {
                     let entry_value = EntryValue::String(value.clone());
                     command.value = entry_value;
@@ -404,12 +442,20 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
             }
 
             if command.name == "rpush" || command.name == "lpush" {
-                if let EntryValue::List(list) = &mut command.value {
-                    list.push_back(value.clone());
+                if i == 1 {
+                    command.key = value.clone();
+                } else {
+                    if let EntryValue::List(list) = &mut command.value {
+                        list.push_back(value.clone());
+                    }
                 }
             }
 
             if command.name == "lrange" {
+                if i == 1 {
+                    command.key = value.clone();
+                }
+
                 if i == 2 {
                     let opt = command.option.get_or_insert_with(|| CommandOption::LRange(LRangeOption { start: 0, stop: 0 }));
                     if let CommandOption::LRange(lrange_opt) = opt {
@@ -423,6 +469,10 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
                 }
 
                 if i == 3 {
+                    if i == 1 {
+                        command.key = value.clone();
+                    }
+                    
                     let opt = command.option.get_or_insert_with(|| CommandOption::LRange(LRangeOption { start: 0, stop: 0 }));
                     if let CommandOption::LRange(lrange_opt) = opt {
                         lrange_opt.stop = match value.parse::<i32>() {
@@ -436,6 +486,10 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
             }
 
             if command.name == "lpop" {
+                if i == 1 {
+                    command.key = value.clone();
+                }
+
                 if i == 2 {
                     let count = match value.parse::<usize>() {
                         Ok(v) => v,
@@ -444,6 +498,22 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
                         }
                     };
                     command.option = Some(CommandOption::LPop(LPopOption { count: count }));
+                }
+            }
+
+            if command.name == "blpop" {
+                if i > 0 && i < number_of_elements - 1 {
+                    if let EntryValue::List(list) = &mut command.value {
+                        list.push_back(value.clone());
+                    }
+                }
+
+                if i == number_of_elements - 1 {
+                    let timeout = match value.parse::<f32>() {
+                        Ok(v) => v,
+                        Err(_err) => -1.0
+                    };
+                    command.option = Some(CommandOption::BLPop(BLPopOption { timeout }));
                 }
             }
         }
@@ -499,6 +569,7 @@ enum CommandOption {
     Set(SetOption),
     LRange(LRangeOption),
     LPop(LPopOption),
+    BLPop(BLPopOption),
 }
 #[derive(Debug, Clone)]
 struct SetOption {
@@ -516,6 +587,11 @@ struct LRangeOption {
 #[derive(Debug, Clone)]
 struct LPopOption {
     count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BLPopOption {
+    timeout: f32,
 }
 
 #[derive(Debug, Clone)]
