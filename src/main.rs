@@ -1,14 +1,15 @@
 #![allow(unused_imports)]
 use std::collections::{vec_deque, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::spawn;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
+use tokio::time::Timeout;
 
 const CRLF_TERMINATOR_LEN: usize = 2;
 
@@ -32,15 +33,15 @@ impl AppState {
 struct DB {
     entries: HashMap<String, Entry>,
     pub_sub: HashMap<String, String>,
-    background_task: Notify,
+    waiting_task: HashMap<String, Arc<tokio::sync::Notify>>,
 }
 
 impl DB {
     pub fn new() -> Self {
         let db = DB {
             entries: HashMap::new(),
+            waiting_task: HashMap::new(),
             pub_sub: HashMap::new(),
-            background_task: Notify::new(),
         };
         db
     }
@@ -138,25 +139,65 @@ impl DB {
         }
     }
 
-    pub fn blpop(&mut self, keys: VecDeque<String>, timeout: f32) -> (String, String) {
-        let mut result: (String, String) = (String::new(), String::new());
+    pub async fn blpop(db_mutex: Arc<Mutex<DB>>, keys: VecDeque<String>, timeout: f64) -> (String, String) {
+        let duration = tokio::time::Duration::from_secs_f64(timeout);
 
-        for key in keys {
-            let entry = self.entries.get_mut(&key);
-            if let Some(entry) = entry {
-                if let EntryValue::List(ref mut list) = entry.value {
-                    if let Some(element) = list.pop_front() {
-                        result = (key, element);
+        loop {
+            let mut db_guard = db_mutex.lock().await;
+
+            for key in &keys {
+                if let Some(entry) = db_guard.entries.get_mut(key) {
+                    if let EntryValue::List(list) = &mut entry.value {
+                        if let Some(value) = list.pop_front() {
+                            return (key.clone(), value);
+                        }
                     }
                 }
             }
-        }
 
-        result
+            let mut notify_handle: Option<Arc<Notify>> = None;
+            let mut key_to_wait = String::new();
+
+            if let Some(key) = keys.front() {
+                key_to_wait = key.clone();
+
+                let notify = db_guard.waiting_task.entry(key.clone()).or_insert_with(|| Arc::new(Notify::new())).clone();
+
+                notify_handle = Some(notify);
+            }
+
+            drop(db_guard);
+
+            if let Some(notify) = notify_handle {
+                if timeout == 0.0 {
+                    notify.notified().await;
+                    continue;
+                } else {
+                    match tokio::time::timeout(duration, notify.notified()).await {
+                        Ok(_) => {
+                            continue;
+                        },
+                        Err(_) => {
+                            return ("".to_string(), "".to_string());
+                        }
+                    }
+                }
+            } else {
+                return ("".to_string(), "".to_string());
+            }
+        }
     }
 
     pub fn remove(&mut self, key: &String) -> Option<Entry> {
         self.entries.remove(key)
+    }
+
+    pub fn notify_waiting_tasks(&mut self, key: &str) {
+        if let Some(notify) = self.waiting_task.get(key) {
+            notify.notify_one();
+
+            self.waiting_task.remove(key);
+        }
     }
 }
 
@@ -168,14 +209,14 @@ async fn main() {
     let app_state = AppState::new();
     loop {
         let (stream, _) = listener.accept().await.unwrap();
-        let map = Arc::clone(&app_state.db);
+        let db = Arc::clone(&app_state.db);
         tokio::spawn(async move {
-            handle_response(stream, map).await;
+            handle_response(stream, db).await;
         });
     }
 }
 
-async fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
+async fn handle_response(mut stream: TcpStream, app_state: Arc<Mutex<DB>>) {
     loop {
         let mut buf = [0; 512];
         let size = stream.read(&mut buf).await.unwrap();
@@ -187,7 +228,7 @@ async fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
             Ok(command) => {
                 let response: String;
                 {
-                    let mut entries = map.lock().unwrap();
+                    let mut db_guard = app_state.lock().await;
                     response = match command.name.as_str() {
                         "ping" => "+PONG\r\n".to_string(),
 
@@ -208,11 +249,11 @@ async fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                                 value: command.value.clone(), 
                                 expires_at,
                             };
-                            entries.set(&command.key, entry);
+                            db_guard.set(&command.key, entry);
                             "+OK\r\n".to_string()
                         },
 
-                        "get" => match entries.get(&command.key) {
+                        "get" => match db_guard.get(&command.key) {
                             Some(entry) => match &entry.value {
                                 EntryValue::String(s) => format!("${}\r\n{}\r\n", s.len(), s),
                                 _ => "$-1\r\n".to_string(),
@@ -222,7 +263,8 @@ async fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
 
                         "rpush" => {
                             if let EntryValue::List(list) = command.value.clone() {
-                                let len = entries.rpush(&command.key, list);
+                                let len = db_guard.rpush(&command.key, list);
+                                db_guard.notify_waiting_tasks(&command.key);
                                 format!(":{}\r\n", len)
                             } else {
                                 "-ERR wrong type\r\n".to_string()
@@ -231,7 +273,7 @@ async fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
 
                         "lpush" => {
                             if let EntryValue::List(list) = command.value.clone() {
-                                let len = entries.lpush(&command.key, list);
+                                let len = db_guard.lpush(&command.key, list);
                                 format!(":{}\r\n", len)
                             } else {
                                 "-ERR wrong type\r\n".to_string()
@@ -241,7 +283,7 @@ async fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                         "lrange" => {
                             match command.option {
                                 Some(CommandOption::LRange(mut option)) => {
-                                    match entries.get(&command.key) {
+                                    match db_guard.get(&command.key) {
                                         Some(entry) => {
                                             if let EntryValue::List(list) = &entry.value {
                                                 let len = list.len() as i32;
@@ -280,7 +322,7 @@ async fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                         }
 
                         "llen" => {
-                            match entries.get(&command.key) {
+                            match db_guard.get(&command.key) {
                                 Some(entry) => {
                                     if let EntryValue::List(list) = &entry.value {
                                         format!(":{}\r\n", list.len())
@@ -302,7 +344,7 @@ async fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                             if wrong_type {
                                 "-ERR wrong command option type\r\n".to_string()
                             } else {
-                                match entries.lpop(&command.key, count) {
+                                match db_guard.lpop(&command.key, count) {
                                     Ok(list) => {
                                         match list.len() {
                                             0 => {
@@ -331,7 +373,9 @@ async fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
                                     if let CommandOption::BLPop(blpop_opt) = opt {
                                         if blpop_opt.timeout != -1.0 {
                                             if let EntryValue::List(keys) = command.value {
-                                                let (key, value) = entries.blpop(keys, blpop_opt.timeout);
+                                                drop(db_guard);
+                                                let app_state_clone = app_state.clone();
+                                                let (key, value) = DB::blpop(app_state_clone, keys, blpop_opt.timeout).await;
                                                 format!("*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n", key.len(), key, value.len(), value)
                                             } else {
                                                 "-ERR WRONGTYPE Option\r\n".to_string()
@@ -362,11 +406,20 @@ async fn handle_response(mut stream: TcpStream, map: Arc<Mutex<DB>>) {
 }
 
 fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
-    let number_of_elements = asc2_to_decimal(buf[1]);
-
-    // First byte: '*' 
+    // First byte: '*'
+    let mut index = 0;
     // Second byte: number of elements
-    let mut index = 2 + CRLF_TERMINATOR_LEN;
+    let (number_of_elements, consumed_header) = match read_length(&buf[index..], b'*') {
+        Ok(v) => v,
+        Err(e) => return Err(e), 
+    };
+
+    index += consumed_header;
+
+    if number_of_elements == 0 {
+        return Err(CommandParserErr::Invalid);
+    }
+
     let mut command = Command {
         name: String::new(),
         key: String::new(),
@@ -375,11 +428,22 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
     };
 
     for i in 0..number_of_elements {
-        // character $
-        index += 1;
-        let len = read_length(&buf, &mut index).unwrap();
-        index += CRLF_TERMINATOR_LEN + 1;
-        let value = str::from_utf8(&buf[index..index + len]).unwrap().to_lowercase();
+        if index >= buf.len() {
+            return Err(CommandParserErr::Invalid);
+        }
+
+        let (bulk_len, consumed_header) = match read_length(&buf[index..], b'$') {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+
+        index += consumed_header;
+
+        if index + bulk_len + CRLF_TERMINATOR_LEN > buf.len() {
+            return Err(CommandParserErr::Invalid); 
+        }
+
+        let value = str::from_utf8(&buf[index..index + bulk_len]).unwrap().to_lowercase();
 
         if i == 0 && !SUPPORT_COMMANDS.contains(&value.as_str()) {
             return Err(CommandParserErr::UnknowCommand);
@@ -391,6 +455,10 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
                 command.value = EntryValue::List(VecDeque::new());
             }
         } else {
+            if command.name == "echo" && i == 1 {
+                command.key = value.clone();
+            }
+
             if command.name == "get" || command.name == "set" {
                 if i == 1 {
                     command.key = value.clone();
@@ -451,6 +519,10 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
                 }
             }
 
+            if command.name == "llen" && i == 1 {
+                command.key = value.clone();
+            }
+
             if command.name == "lrange" {
                 if i == 1 {
                     command.key = value.clone();
@@ -509,7 +581,7 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
                 }
 
                 if i == number_of_elements - 1 {
-                    let timeout = match value.parse::<f32>() {
+                    let timeout = match value.parse::<f64>() {
                         Ok(v) => v,
                         Err(_err) => -1.0
                     };
@@ -518,38 +590,45 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
             }
         }
 
-        index += len + CRLF_TERMINATOR_LEN;
+        index += bulk_len + CRLF_TERMINATOR_LEN;
     }
 
     Ok(command)
 }
 
-fn asc2_to_decimal(byte: u8) -> u8 {
-    byte - b'0'
-}
-
-fn read_length(buf: &[u8], index: &mut usize) -> Result<usize, &'static str> {
-    if *index >= buf.len() {
-        return Err("invalid index");
+fn read_length(buf: &[u8], prefix: u8) -> Result<(usize, usize), CommandParserErr> {
+    if buf.is_empty() || buf[0] != prefix {
+        return Err(CommandParserErr::Invalid);
     }
-    let mut len_buf = Vec::new();
-    loop {
-        len_buf.push(buf[*index]);
-        if buf[*index + 1] == b'\r' {
-            break;
+
+    if let Some(crlf_index) = buf[1..].windows(2).position(|window| window == [b'\r', b'\n']) {
+        let end_of_number = 1 + crlf_index; 
+
+        let number_bytes = &buf[1..end_of_number];
+
+        if let Ok(number_str) = str::from_utf8(number_bytes) {
+            
+            match number_str.parse::<usize>() {
+                Ok(size) => {
+                    let consumed_bytes = end_of_number + 2; 
+
+                    Ok((size, consumed_bytes))
+                },
+                Err(_) => Err(CommandParserErr::Invalid),
+            }
+        } else {
+            Err(CommandParserErr::Invalid)
         }
-        *index += 1;
+    } else {
+        Err(CommandParserErr::Invalid)
     }
-    let s = String::from_utf8(len_buf).unwrap();
-    let len = s.parse::<usize>().unwrap();
-
-    Ok(len)
 }
 
 #[derive(Debug)]
 enum CommandParserErr {
     UnknowCommand,
     InvalidOption,
+    Invalid,
 }
 
 enum OperationErr {
@@ -591,7 +670,7 @@ struct LPopOption {
 
 #[derive(Debug, Clone)]
 struct BLPopOption {
-    timeout: f32,
+    timeout: f64,
 }
 
 #[derive(Debug, Clone)]
