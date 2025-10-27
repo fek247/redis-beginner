@@ -376,7 +376,11 @@ async fn handle_response(mut stream: TcpStream, app_state: Arc<Mutex<DB>>) {
                                                 drop(db_guard);
                                                 let app_state_clone = app_state.clone();
                                                 let (key, value) = DB::blpop(app_state_clone, keys, blpop_opt.timeout).await;
-                                                format!("*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n", key.len(), key, value.len(), value)
+                                                if key.is_empty() && value.is_empty() {
+                                                    "*-1\r\n".to_string()
+                                                } else {
+                                                    format!("*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n", key.len(), key, value.len(), value)
+                                                }   
                                             } else {
                                                 "-ERR WRONGTYPE Option\r\n".to_string()
                                             }
