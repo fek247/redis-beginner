@@ -13,7 +13,7 @@ use tokio::time::Timeout;
 
 const CRLF_TERMINATOR_LEN: usize = 2;
 
-const SUPPORT_COMMANDS: [&str; 10] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange", "llen", "lpop", "blpop"];
+const SUPPORT_COMMANDS: [&str; 11] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange", "llen", "lpop", "blpop", "type"];
 
 const SET_SUPPORT_OPTION: [&str; 8] = ["ex", "px", "exat", "pxat", "nx", "xx", "keepttl", "get"];
 
@@ -393,7 +393,18 @@ async fn handle_response(mut stream: TcpStream, app_state: Arc<Mutex<DB>>) {
                                 },
                                 None => "-ERR missing param\r\n".to_string(),
                             }
+                        }
 
+                        "type" => {
+                            match db_guard.get(&command.key) {
+                                Some(entry) => match &entry.value {
+                                    EntryValue::String(_) => "+string\r\n".to_string(),
+                                    EntryValue::List(_) => "+list\r\n".to_string(),
+                                    EntryValue::Set(_) => "+set\r\n".to_string(),
+                                    _ => "+none\r\n".to_string(),
+                                },
+                                None => "+none\r\n".to_string(),
+                            }
                         }
 
                         _ => "-ERR unknown command\r\n".to_string(),
@@ -591,6 +602,10 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
                     };
                     command.option = Some(CommandOption::BLPop(BLPopOption { timeout }));
                 }
+            }
+
+            if command.name == "type" && i == 1 {
+                command.key = value.clone();
             }
         }
 
