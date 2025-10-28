@@ -13,7 +13,7 @@ use tokio::time::Timeout;
 
 const CRLF_TERMINATOR_LEN: usize = 2;
 
-const SUPPORT_COMMANDS: [&str; 11] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange", "llen", "lpop", "blpop", "type"];
+const SUPPORT_COMMANDS: [&str; 12] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange", "llen", "lpop", "blpop", "type", "xadd"];
 
 const SET_SUPPORT_OPTION: [&str; 8] = ["ex", "px", "exat", "pxat", "nx", "xx", "keepttl", "get"];
 
@@ -607,6 +607,24 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
             if command.name == "type" && i == 1 {
                 command.key = value.clone();
             }
+                
+            if command.name == "xadd" {
+                if i == 1 {
+                    command.key = value.clone();
+                }
+
+                if i == 2 {
+                    command.value = EntryValue::String(value.clone());
+                }
+
+                if i > 2 && i % 2 == 1 {
+                    
+                }
+
+                if i > 2 && i % 2 == 0 {
+
+                }
+            }
         }
 
         index += bulk_len + CRLF_TERMINATOR_LEN;
@@ -668,6 +686,7 @@ enum CommandOption {
     LRange(LRangeOption),
     LPop(LPopOption),
     BLPop(BLPopOption),
+    XAdd(Vec<XAddOption>),
 }
 #[derive(Debug, Clone)]
 struct SetOption {
@@ -690,6 +709,12 @@ struct LPopOption {
 #[derive(Debug, Clone)]
 struct BLPopOption {
     timeout: f64,
+}
+
+#[derive(Debug, Clone)]
+struct XAddOption {
+    key: String,
+    value: String,
 }
 
 #[derive(Debug, Clone)]
