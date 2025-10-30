@@ -239,7 +239,7 @@ async fn handle_response(mut stream: TcpStream, app_state: Arc<Mutex<DB>>) {
         if size <= 0 {
             break;
         }
-        let command = command_parser(buf);
+        let command = command_parser(buf, &app_state).await;
         match command {
             Ok(command) => {
                 let response: String;
@@ -448,14 +448,26 @@ async fn handle_response(mut stream: TcpStream, app_state: Arc<Mutex<DB>>) {
 
                 let _  = stream.write(response.as_bytes()).await;
             },
-            Err(_e) => {
-                let _ = stream.write(String::from("-ERR unknown command\r\n").as_bytes()).await;
+            Err(e) => {
+                let err_response = match e {
+                    CommandParserErr::XAddKeyNotEqual0 => {
+                        "-ERR The ID specified in XADD must be greater than 0-0\r\n".to_string()
+                    }
+                    CommandParserErr::XAddKeyNotValid => {
+                        "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n".to_string()
+                    }
+                    _ => {
+                        "-ERR unknown command\r\n".to_string()
+                    }
+                };
+
+                let _ = stream.write(err_response.as_bytes()).await;
             }
         }
     }
 }
 
-fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
+async fn command_parser(buf: [u8; 512], app_state: &Arc<Mutex<DB>>) -> Result<Command, CommandParserErr>  {
     // First byte: '*'
     let mut index = 0;
     // Second byte: number of elements
@@ -645,6 +657,36 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
                 }
 
                 if i == 2 {
+                    if String::eq(&value, "0-0") {
+                        return Err(CommandParserErr::XAddKeyNotEqual0);
+                    }
+
+                    let db_guard = app_state.lock().await;
+                    let entry = db_guard.entries.get(&command.key);
+                    let last_stream_entry = match entry {
+                        Some(entry) => {
+                            if let EntryValue::Stream(ref stream_entrys) = entry.value {
+                                match stream_entrys.last() {
+                                    Some(stream_entry) => {
+                                        stream_entry.id.clone()
+                                    },
+                                    None => "0-0".to_string()
+                                }
+                            } else {
+                                "-1".to_string()
+                            }
+                        },
+                        None => "0-0".to_string()
+                    };
+        
+                    drop(db_guard);
+
+                    let is_valid = check_valid_stream_id(&value, &last_stream_entry);
+
+                    if !is_valid {
+                        return Err(CommandParserErr::XAddKeyNotValid);
+                    }
+
                     command.value = EntryValue::String(value.clone());
                 }
 
@@ -701,11 +743,32 @@ fn read_length(buf: &[u8], prefix: u8) -> Result<(usize, usize), CommandParserEr
     }
 }
 
+fn check_valid_stream_id(value: &str, last_stream_entry: &str) -> bool {
+    let parts: Vec<&str> = value.split('-').collect();
+    let parts_last_stream: Vec<&str> = last_stream_entry.split('-').collect();
+
+    if parts.len() != 2 || parts_last_stream.len() != 2 {
+        return false;
+    }
+
+    if parts[0] < parts_last_stream[0] {
+        return false;
+    }
+
+    if parts[0] == parts_last_stream[0] && parts[1] <= parts_last_stream[1] {
+        return false;
+    }
+
+    true
+}
+
 #[derive(Debug)]
 enum CommandParserErr {
     UnknowCommand,
     InvalidOption,
     Invalid,
+    XAddKeyNotValid,
+    XAddKeyNotEqual0,
 }
 
 enum OperationErr {
