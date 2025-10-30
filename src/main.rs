@@ -201,17 +201,22 @@ impl DB {
     }
 
     pub fn xadd(&mut self, key: &String, stream_id: String, stream_entries: Vec<XAddPair>) {
+        let new_entry = StreamEntryValue {
+            id: stream_id,
+            pairs: stream_entries,
+        };
+
         self.entries
             .entry(key.to_string())
             .and_modify(|entry| {
                 if let EntryValue::Stream(ref mut map) = entry.value {
-                    map.push(StreamEntryValue { id: stream_id, pairs: stream_entries });
+                    map.push(new_entry.clone());
                 } else {
                     println!("Err");
                 }
             })
             .or_insert_with(|| Entry {
-                value: EntryValue::Stream(vec![]),
+                value: EntryValue::Stream(vec![new_entry]),
                 expires_at: None,
             });
     }
@@ -687,7 +692,9 @@ async fn command_parser(buf: [u8; 512], app_state: &Arc<Mutex<DB>>) -> Result<Co
                         return Err(CommandParserErr::XAddKeyNotValid);
                     }
 
-                    command.value = EntryValue::String(value.clone());
+                    let formated_value = format_stream_id(&value, &last_stream_entry);
+
+                    command.value = EntryValue::String(formated_value);
                 }
 
                 if i > 2 && i % 2 == 1 {
@@ -747,6 +754,10 @@ fn check_valid_stream_id(value: &str, last_stream_entry: &str) -> bool {
     let parts: Vec<&str> = value.split('-').collect();
     let parts_last_stream: Vec<&str> = last_stream_entry.split('-').collect();
 
+    if parts.len() == 1 && parts[0] == "*" {
+        return true;
+    }
+
     if parts.len() != 2 || parts_last_stream.len() != 2 {
         return false;
     }
@@ -755,11 +766,32 @@ fn check_valid_stream_id(value: &str, last_stream_entry: &str) -> bool {
         return false;
     }
 
+    if parts[1] == "*" {
+        return true;
+    }
+
     if parts[0] == parts_last_stream[0] && parts[1] <= parts_last_stream[1] {
         return false;
     }
 
     true
+}
+
+fn format_stream_id(value: &str, last_stream_entry: &str) -> String {
+    let parts: Vec<&str> = value.split('-').collect();
+    let parts_last_stream: Vec<&str> = last_stream_entry.split('-').collect();
+
+    if parts[1] == "*" {
+        let seq = if parts[0] > parts_last_stream[0] {
+            0
+        } else {
+            parts_last_stream[1].parse::<u64>().unwrap() + 1
+        };
+
+        return format!("{}-{}", parts[0], seq);
+    }
+
+    value.to_string()
 }
 
 #[derive(Debug)]
