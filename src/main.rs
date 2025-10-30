@@ -199,6 +199,22 @@ impl DB {
             self.waiting_task.remove(key);
         }
     }
+
+    pub fn xadd(&mut self, key: &String, stream_id: String, stream_entries: Vec<XAddPair>) {
+        self.entries
+            .entry(key.to_string())
+            .and_modify(|entry| {
+                if let EntryValue::Stream(ref mut map) = entry.value {
+                    map.push(StreamEntryValue { id: stream_id, pairs: stream_entries });
+                } else {
+                    println!("Err");
+                }
+            })
+            .or_insert_with(|| Entry {
+                value: EntryValue::Stream(vec![]),
+                expires_at: None,
+            });
+    }
 }
 
 #[tokio::main]
@@ -401,9 +417,28 @@ async fn handle_response(mut stream: TcpStream, app_state: Arc<Mutex<DB>>) {
                                     EntryValue::String(_) => "+string\r\n".to_string(),
                                     EntryValue::List(_) => "+list\r\n".to_string(),
                                     EntryValue::Set(_) => "+set\r\n".to_string(),
+                                    EntryValue::Stream(_) => "+stream\r\n".to_string(),
                                     _ => "+none\r\n".to_string(),
                                 },
                                 None => "+none\r\n".to_string(),
+                            }
+                        }
+
+                        "xadd" => {
+                            match command.option {
+                                Some(opt) => {
+                                    if let CommandOption::XAdd(pairs) = opt {
+                                        if let EntryValue::String(stream_id) = command.value {
+                                            db_guard.xadd(&command.key, stream_id.clone(), pairs);
+                                            format!("${}\r\n{}\r\n", stream_id.len(), stream_id)
+                                        } else {
+                                            "-ERR WRONGTYPE Option\r\n".to_string()
+                                        }
+                                    } else {
+                                        "-ERR WRONGTYPE Option\r\n".to_string()
+                                    }
+                                },
+                                None => "-ERR wrong number of arguments for 'XADD' command".to_string()
                             }
                         }
 
@@ -555,11 +590,7 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
                     }
                 }
 
-                if i == 3 {
-                    if i == 1 {
-                        command.key = value.clone();
-                    }
-                    
+                if i == 3 {                    
                     let opt = command.option.get_or_insert_with(|| CommandOption::LRange(LRangeOption { start: 0, stop: 0 }));
                     if let CommandOption::LRange(lrange_opt) = opt {
                         lrange_opt.stop = match value.parse::<i32>() {
@@ -618,11 +649,20 @@ fn command_parser(buf: [u8; 512]) -> Result<Command, CommandParserErr>  {
                 }
 
                 if i > 2 && i % 2 == 1 {
-                    
+                    let opt = command.option.get_or_insert_with(|| CommandOption::XAdd(vec![]));
+                    if let CommandOption::XAdd(list) = opt {
+                        let xadd_opt = XAddPair { key: value.clone(), value: String::new() };
+                        list.push(xadd_opt);
+                    }
                 }
 
                 if i > 2 && i % 2 == 0 {
-
+                    let opt = command.option.get_or_insert_with(|| CommandOption::XAdd(vec![]));
+                    if let CommandOption::XAdd(list) = opt {
+                        if let Some(last) = list.last_mut() {
+                            last.value = value.clone();
+                        }
+                    }
                 }
             }
         }
@@ -686,7 +726,7 @@ enum CommandOption {
     LRange(LRangeOption),
     LPop(LPopOption),
     BLPop(BLPopOption),
-    XAdd(Vec<XAddOption>),
+    XAdd(Vec<XAddPair>),
 }
 #[derive(Debug, Clone)]
 struct SetOption {
@@ -712,9 +752,15 @@ struct BLPopOption {
 }
 
 #[derive(Debug, Clone)]
-struct XAddOption {
+struct XAddPair {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Clone)]
+struct StreamEntryValue {
+    id: String,
+    pairs: Vec<XAddPair>,
 }
 
 #[derive(Debug, Clone)]
@@ -729,6 +775,7 @@ enum EntryValue {
     List(VecDeque<String>),
     Map(HashMap<String, String>),
     Set(Vec<String>),
+    Stream(Vec<StreamEntryValue>),
 }
 
 impl SetOption {
