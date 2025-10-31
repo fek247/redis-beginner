@@ -3,7 +3,7 @@ use std::collections::{vec_deque, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{Arc};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -728,12 +728,11 @@ fn read_length(buf: &[u8], prefix: u8) -> Result<(usize, usize), CommandParserEr
     }
 
     if let Some(crlf_index) = buf[1..].windows(2).position(|window| window == [b'\r', b'\n']) {
-        let end_of_number = 1 + crlf_index; 
+        let end_of_number = 1 + crlf_index;
 
         let number_bytes = &buf[1..end_of_number];
 
         if let Ok(number_str) = str::from_utf8(number_bytes) {
-            
             match number_str.parse::<usize>() {
                 Ok(size) => {
                     let consumed_bytes = end_of_number + 2; 
@@ -753,7 +752,6 @@ fn read_length(buf: &[u8], prefix: u8) -> Result<(usize, usize), CommandParserEr
 fn check_valid_stream_id(value: &str, last_stream_entry: &str) -> bool {
     let parts: Vec<&str> = value.split('-').collect();
     let parts_last_stream: Vec<&str> = last_stream_entry.split('-').collect();
-
     if parts.len() == 1 && parts[0] == "*" {
         return true;
     }
@@ -781,7 +779,16 @@ fn format_stream_id(value: &str, last_stream_entry: &str) -> String {
     let parts: Vec<&str> = value.split('-').collect();
     let parts_last_stream: Vec<&str> = last_stream_entry.split('-').collect();
 
-    if parts[1] == "*" {
+    if parts.len() == 1 && parts[0] == "*" {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("System time before UNIX EPOCH!").as_millis().to_string();
+        let seq = if String::eq(&timestamp, parts_last_stream[0]) {
+            parts_last_stream[1].parse::<u64>().unwrap() + 1
+        } else {
+            0
+        };
+
+        return format!("{}-{}", timestamp, seq);
+    } else if parts[1] == "*" {
         let seq = if parts[0] > parts_last_stream[0] {
             0
         } else {
