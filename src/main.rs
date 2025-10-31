@@ -13,7 +13,7 @@ use tokio::time::Timeout;
 
 const CRLF_TERMINATOR_LEN: usize = 2;
 
-const SUPPORT_COMMANDS: [&str; 12] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange", "llen", "lpop", "blpop", "type", "xadd"];
+const SUPPORT_COMMANDS: [&str; 13] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange", "llen", "lpop", "blpop", "type", "xadd", "xrange"];
 
 const SET_SUPPORT_OPTION: [&str; 8] = ["ex", "px", "exat", "pxat", "nx", "xx", "keepttl", "get"];
 
@@ -714,6 +714,19 @@ async fn command_parser(buf: [u8; 512], app_state: &Arc<Mutex<DB>>) -> Result<Co
                     }
                 }
             }
+
+            if command.name == "xrange" {
+                if i == 1 {
+                    command.key = value.clone();
+                }
+
+                if i == 2 {
+                    let opt = command.option.get_or_insert_with(|| CommandOption::XRange(XRangeOption { start: String::new(), end: String::new() }));
+                    if let CommandOption::XRange(xrange_opt) = opt {
+                        
+                    }
+                }
+            }
         }
 
         index += bulk_len + CRLF_TERMINATOR_LEN;
@@ -829,6 +842,7 @@ enum CommandOption {
     LPop(LPopOption),
     BLPop(BLPopOption),
     XAdd(Vec<XAddPair>),
+    XRange(XRangeOption),
 }
 #[derive(Debug, Clone)]
 struct SetOption {
@@ -857,6 +871,12 @@ struct BLPopOption {
 struct XAddPair {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Clone)]
+struct XRangeOption {
+    start: String,
+    end: String,
 }
 
 #[derive(Debug, Clone)]
