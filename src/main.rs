@@ -11,8 +11,6 @@ use tokio::spawn;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Timeout;
 
-mod cmd;
-
 const CRLF_TERMINATOR_LEN: usize = 2;
 
 const SUPPORT_COMMANDS: [&str; 13] = ["ping", "echo", "set", "get", "rpush", "lpush", "lrange", "llen", "lpop", "blpop", "type", "xadd", "xrange"];
