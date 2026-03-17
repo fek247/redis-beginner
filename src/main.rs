@@ -33,7 +33,7 @@ impl AppState {
 struct DB {
     entries: HashMap<String, Entry>,
     pub_sub: HashMap<String, String>,
-    waiting_task: HashMap<String, Arc<tokio::sync::Notify>>,
+    waiting_task: HashMap<String, Vec<Arc<tokio::sync::Notify>>>,
 }
 
 impl DB {
@@ -142,6 +142,8 @@ impl DB {
     pub async fn blpop(db_mutex: Arc<Mutex<DB>>, keys: VecDeque<String>, timeout: f64) -> (String, String) {
         let duration = tokio::time::Duration::from_secs_f64(timeout);
 
+        let task_notify = Arc::new(Notify::new());
+
         loop {
             let mut db_guard = db_mutex.lock().await;
 
@@ -155,35 +157,24 @@ impl DB {
                 }
             }
 
-            let mut notify_handle: Option<Arc<Notify>> = None;
-            let mut key_to_wait = String::new();
-
-            if let Some(key) = keys.front() {
-                key_to_wait = key.clone();
-
-                let notify = db_guard.waiting_task.entry(key.clone()).or_insert_with(|| Arc::new(Notify::new())).clone();
-
-                notify_handle = Some(notify);
+            for key in &keys {
+                db_guard.waiting_task.entry(key.clone()).or_insert_with(Vec::new).push(task_notify.clone());
             }
 
             drop(db_guard);
 
-            if let Some(notify) = notify_handle {
-                if timeout == 0.0 {
-                    notify.notified().await;
-                    continue;
-                } else {
-                    match tokio::time::timeout(duration, notify.notified()).await {
-                        Ok(_) => {
-                            continue;
-                        },
-                        Err(_) => {
-                            return ("".to_string(), "".to_string());
-                        }
+            if timeout == 0.0 {
+                task_notify.notified().await;
+                continue;
+            } else {
+                match tokio::time::timeout(duration, task_notify.notified()).await {
+                    Ok(_) => {
+                        continue;
+                    },
+                    Err(_) => {
+                        return ("".to_string(), "".to_string());
                     }
                 }
-            } else {
-                return ("".to_string(), "".to_string());
             }
         }
     }
@@ -193,9 +184,19 @@ impl DB {
     }
 
     pub fn notify_waiting_tasks(&mut self, key: &str) {
-        if let Some(notify) = self.waiting_task.get(key) {
-            notify.notify_one();
+        let is_empty = if let Some(notifies) = self.waiting_task.get_mut(key) {
+            if !notifies.is_empty() {
+                let first_notify = notifies.remove(0);
 
+                first_notify.notify_one();
+            }
+
+            notifies.is_empty()
+        } else {
+            false
+        };
+
+        if is_empty {
             self.waiting_task.remove(key);
         }
     }
